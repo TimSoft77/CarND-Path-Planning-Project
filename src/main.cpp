@@ -8,6 +8,8 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
+#include "FSE.h"
 
 using namespace std;
 
@@ -194,10 +196,12 @@ int main() {
   	map_waypoints_s.push_back(s);
   	map_waypoints_dx.push_back(d_x);
   	map_waypoints_dy.push_back(d_y);
-  }
+	}
+	
+	// FSE is initialized here
+	FSE fse = FSE(50.0*1.6/3.6, 30); // 50 mph speed limit in m/s, 30 m lane change distance
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
-                     uWS::OpCode opCode) {
+  h.onMessage([&fse,&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length, uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
     // The 2 signifies a websocket event
@@ -235,11 +239,163 @@ int main() {
 
           	json msgJson;
 
-          	vector<double> next_x_vals;
-          	vector<double> next_y_vals;
+						// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
 
+						// Configuration constants
+						const double accel = 0.0018; // speed increment over 0.02 s; not entirely sure what it works out to...
+						const int max_previous_pts = 10; // max number of points from previous path to use
+						const double max_speed = 0.43; // slightly less than 50 mph
+						const double s_increment = 30; // m; difference between points to fit the spline
+						const int n_s_pts_future = 3; // number of points in the future to fit the spline
+						const int n_trajectory_pts = 50; // number of points to include in each trajectory
+						const double follow_time = 3; // s
 
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+						// Initialize spline points vectors
+						vector<double> spline_ptsx;
+						vector<double> spline_ptsy;
+
+						// First, figure out where the car will be and will be going at the end of any previous points that will be followed
+						// Determine how many of the previous points to use (lesser of max_previous_pts and the size of the vector)
+						int prev_size = previous_path_x.size();
+						int n_prev_pts = min(max_previous_pts, prev_size);
+
+						// Reference conditions
+						double speed = car_speed*1.6/3.6*0.02;
+						double ref_x = car_x;
+						double ref_y = car_y;
+						double ref_yaw = deg2rad(car_yaw);
+
+						// If previous size is empty, use the car as a starting reference // taken from Udacity walkthrough
+						if (prev_size == 0) {
+							double prev_car_x = car_x - cos(car_yaw);
+							double prev_car_y = car_y - sin(car_yaw);
+
+							spline_ptsx.push_back(prev_car_x);
+							spline_ptsx.push_back(car_x);
+							spline_ptsy.push_back(prev_car_y);
+							spline_ptsy.push_back(car_y);
+
+							// If previous size is 1, use the next point and the current position (this should never happen)
+						} else if (prev_size == 1) {
+							ref_x = previous_path_x[n_prev_pts - 1];
+							ref_y = previous_path_y[n_prev_pts - 1];
+
+							double ref_x_prev = car_x;
+							double ref_y_prev = car_y;
+
+							ref_yaw = atan2(ref_y - ref_y_prev, ref_x - ref_x_prev);
+
+							spline_ptsx.push_back(ref_x_prev);
+							spline_ptsx.push_back(ref_x);
+							spline_ptsy.push_back(ref_y_prev);
+							spline_ptsy.push_back(ref_y);
+
+							speed = distance(ref_x, ref_y, ref_x_prev, ref_y_prev);				
+
+						// Otherwise, use the last two of the previous points that will be included in the new trajectory // taken from Udacity walkthrough
+						} else {
+							ref_x = previous_path_x[n_prev_pts - 1];
+							ref_y = previous_path_y[n_prev_pts - 1];
+
+							double ref_x_prev = previous_path_x[n_prev_pts - 2];
+							double ref_y_prev = previous_path_y[n_prev_pts - 2];
+
+							ref_yaw = atan2(ref_y - ref_y_prev, ref_x - ref_x_prev);
+
+							spline_ptsx.push_back(ref_x_prev);
+							spline_ptsx.push_back(ref_x);
+							spline_ptsy.push_back(ref_y_prev);
+							spline_ptsy.push_back(ref_y);
+
+							speed = distance(ref_x, ref_y, ref_x_prev, ref_y_prev);
+
+						}
+						// cout << "prev_size=" << prev_size << "; speed=" << speed << endl;
+
+						/**
+						 * Criteria for a lange change:
+						 * 1. Car in center of lane (i.e., a lane change is not ongoing already)
+						 * 2. speed_target < max_speed (i.e., a car ahead is slowing us down now)
+						 * 3. Cost function based on:
+						 *   a. Is lane clear
+						 *   b. Lane change more expensive than doing nothing
+						 *   c. Relative speeds of next cars ahead in each lane
+						 */
+						double car_speed_mps = car_speed*1.6/3.6;
+						double d_target = fse.update_d_target(car_s, car_d, car_speed_mps, sensor_fusion);
+						
+						// Build a set of points in frenet coordinates, and convert to global xy coordinates
+						for (int i = 0; i < n_s_pts_future; i++) {
+							vector<double> next_xy_global = getXY(car_s + (1+i)*s_increment, d_target, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+							spline_ptsx.push_back(next_xy_global[0]);
+							spline_ptsy.push_back(next_xy_global[1]);
+						}
+
+						// Determine the speed_target
+						double speed_target = max_speed;
+						double left_bound = min(car_d, d_target) - 2;
+						double right_bound = max(car_d, d_target) + 2;
+						double follow_distance = follow_time*car_speed_mps;
+						for (vector<double> car : sensor_fusion) {
+							if (left_bound < car[6] && car[6] < right_bound && 0 < car[5] - car_s && car[5] - car_s < follow_distance) {
+								// If a car is in the current or future lane, ahead of, and within follow_distance of the driven car, control speed.  At follow_distance, target will be max_speed, at distance = 0 (collision), target will be 0.
+								speed_target = min(speed_target, (car[5] - car_s)/follow_distance*max_speed);
+							}
+						}
+						
+						// Shift from global xy to car xy coordinates (car xy system has x-axis in direction of the car, and with origin at the end of the previous points)
+						// Copied from Udacity project walkthrough
+						for (int i = 0; i < spline_ptsx.size(); i++) {
+							double shift_x = spline_ptsx[i] - ref_x;
+							double shift_y = spline_ptsy[i] - ref_y;
+
+							spline_ptsx[i] = (shift_x*cos(0-ref_yaw) - shift_y*sin(0-ref_yaw));
+							spline_ptsy[i] = (shift_x*sin(0-ref_yaw) + shift_y*cos(0-ref_yaw));
+						}
+
+						// Create and fit a spline
+						tk::spline s;
+						s.set_points(spline_ptsx, spline_ptsy);
+
+						// Initialize the vector of target points, and initialize with previous points up to the limit
+						vector<double> next_x_vals;
+						vector<double> next_y_vals;
+
+						for (int i = 0; i < n_prev_pts; i++) {
+							next_x_vals.push_back(previous_path_x[i]);
+							next_y_vals.push_back(previous_path_y[i]);
+							// These will be in the global xy coordinates, but they're not being used to generate new points anymore
+						}
+
+						// Compute the trajectory, accelerating along the spline
+						double x_pos_car = 0; // Initialize, car coordinates
+						for (int i = 0; i < n_trajectory_pts - n_prev_pts; i++) {
+							// Accelerate to speed_target
+							if (speed < speed_target) {
+								speed = min(speed_target, speed + accel);
+							} else {
+								speed = max(speed_target, speed - accel);
+							}
+							x_pos_car += speed;
+							double y_pos_car = s(x_pos_car);
+
+							// Convert back to global coordinates
+							double x_ref = x_pos_car;
+							double y_ref = y_pos_car;
+
+							double x_pos_global = (x_ref*cos(ref_yaw) - y_ref*sin(ref_yaw));
+							double y_pos_global = (x_ref*sin(ref_yaw) + y_ref*cos(ref_yaw));
+
+							x_pos_global += ref_x;
+							y_pos_global += ref_y;
+
+							// Add next point
+							next_x_vals.push_back(x_pos_global);
+							next_y_vals.push_back(y_pos_global); // Neglects horizontal turning speed - should be ok for non-sharp turns
+						}
+
+						// End TODO
+
           	msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
 
