@@ -1,6 +1,34 @@
 # CarND-Path-Planning-Project
 Self-Driving Car Engineer Nanodegree Program
-   
+
+## Write-up
+
+### Overview
+The code is based in two classes: `main.cpp` and `FSE.cpp` (i.e., a final-state-engine).  `FSE.cpp` contains the logic used to decide which lane to drive in.  Given that information, `main.cpp` determines the current appropriate speed and computes the trajectory.
+
+### Finite State Engine (`FSE.cpp`)
+Despite the name, this isn't clearly written as a finite state engine.  Essentially, the state is two variables: `d_target` which corresponds to the center of the currently desired lane in frenet coordinates, and `is_lane_change_ongoing` which is true during lane changes, and prevents `d_target` from changing mid-lane-change.
+
+If a lane change is not ongoing, the cost is calculated of staying in the current lane, and shifting to either adjacent lane (logic exists to block shifts off the road or into oncoming traffic).  If shifting to a given lane is unsafe, its cost will be set higher than staying in the current lane could possibly be.
+
+A lane change is considered unsafe if:
+* There is a car with an s value close to that of the driven car in the new lane
+* There is a car behind the driven car which would get too close to the driven car in the predicted time it would take to change lanes
+
+The cost for a lane is determined by the speed of the next car ahead in the lane - the higher the next car's speed, the lower that lane's cost.  The cost for changing lanes is made higher by default than for staying in the same lane by the `lane_change_penalty_cost` variable.  An improvement would be to also factor in the distance to the next car in the cost function.
+
+### Trajectory Generation (`main.cpp`, lines 244 - 395)
+The process for calculating the trajectory is:
+1. Calculate the number of previous points to use.  This is capped to avoid being too committed to the previous path.
+2. Obtain the speed, direction, and last two points of the car at the end of the previous path points.
+3. Determine the desired d position of the car in the future through the FSE, and compute a series of points with that d position well ahead of the car in global XY coordinates.
+4. Determine the desired speed of the car.  The speed of the car is calculated to keep it 3 seconds behind the closest car in its current or future lane (or the speed limit, if there is no slow car ahead).
+5. Convert the last two previous path points and the future points into car XY coordinates.
+6. Calculate a spline of the car XY coordinate points.
+7. Calculate the trajectory by moving along the spline, accelerating at a constant rate from the speed at the end of the previous path points to the desired speed.
+8. Convert the trajectory back to global XY coordinates.
+
+---   
 ### Simulator.
 You can download the Term3 Simulator which contains the Path Planning Project from the [releases tab (https://github.com/udacity/self-driving-car-sim/releases).
 
